@@ -5,6 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Mod Downloader — Modrinth + CurseForge</title>
   <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
+  <script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
   <style>
     :root { color-scheme: dark; }
     .glass { background: rgba(17, 24, 39, 0.72); backdrop-filter: blur(10px); }
@@ -71,6 +72,27 @@
                 <option selected>20</option>
                 <option>40</option>
               </select>
+            </div>
+          </div>
+
+          <div class="flex flex-col sm:flex-row gap-3 sm:items-end">
+            <div class="flex-1">
+              <div class="text-sm text-slate-300">Архив ZIP</div>
+              <div class="mt-1 grid sm:grid-cols-3 gap-2">
+                <label class="flex items-center gap-2 px-3 py-2 rounded-xl border border-white/10 bg-slate-950/40 text-sm cursor-pointer select-none">
+                  <input id="zipWithDeps" type="checkbox" class="accent-cyan-400" checked />
+                  <span>С зависимостями</span>
+                </label>
+                <label class="flex items-center gap-2 px-3 py-2 rounded-xl border border-white/10 bg-slate-950/40 text-sm cursor-pointer select-none">
+                  <input id="zipRecursive" type="checkbox" class="accent-cyan-400" checked />
+                  <span>Рекурсивно</span>
+                </label>
+                <label class="flex items-center gap-2 px-3 py-2 rounded-xl border border-white/10 bg-slate-950/40 text-sm cursor-pointer select-none">
+                  <input id="zipIncludeOptional" type="checkbox" class="accent-cyan-400" />
+                  <span>Опциональные</span>
+                </label>
+              </div>
+              <p class="mt-1 text-xs text-slate-400">ZIP собирается в браузере: <span class="mono">mods/</span> + выбранный мод и зависимости (если поддерживается API/доступны прямые ссылки).</p>
             </div>
           </div>
 
@@ -215,6 +237,122 @@
     }
 
     // --- Modrinth API ---
+    async function fetchJson(url, options) {
+      const res = await fetch(url, options);
+      if (!res.ok) {
+        const t = await res.text().catch(() => '');
+        throw new Error(`${res.status} ${t?.slice(0, 140) || ''}`.trim());
+      }
+      return res.json();
+    }
+
+    async function fetchArrayBuffer(url, options) {
+      const res = await fetch(url, options);
+      if (!res.ok) {
+        const t = await res.text().catch(() => '');
+        throw new Error(`${res.status} ${t?.slice(0, 140) || ''}`.trim());
+      }
+      return res.arrayBuffer();
+    }
+
+    function safeName(s) {
+      return String(s || 'file').replace(/[\\/:*?"<>|]+/g, '_').replace(/\s+/g, ' ').trim();
+    }
+
+    function pickModrinthFileFromVersion(v) {
+      const file = v?.files?.find(f => f.primary) || v?.files?.[0] || null;
+      if (!file) return null;
+      return {
+        kind: 'file',
+        source: 'Modrinth',
+        projectId: v.project_id,
+        versionId: v.id,
+        versionName: v.name,
+        fileName: file.filename,
+        url: file.url,
+        size: file.size,
+        hash: file.hashes?.sha1 || file.hashes?.sha512 || null,
+      };
+    }
+
+    function depTypeToHuman(t) {
+      const map = {
+        required: 'required',
+        optional: 'optional',
+        incompatible: 'incompatible',
+        embedded: 'embedded',
+      };
+      return map[t] || String(t || 'unknown');
+    }
+
+    async function getModrinthBestVersion(projectId, { loader, mc }) {
+      const vurl = new URL(`https://api.modrinth.com/v2/project/${projectId}/version`);
+      if (mc) vurl.searchParams.set('game_versions', JSON.stringify([mc]));
+      if (loader && loader !== 'any') vurl.searchParams.set('loaders', JSON.stringify([loader]));
+      const versions = await fetchJson(vurl.toString(), { headers: { 'User-Agent': 'ModDownloader/1.0 (browser)' } });
+      return versions?.[0] || null;
+    }
+
+    async function getModrinthProject(projectId) {
+      return fetchJson(`https://api.modrinth.com/v2/project/${projectId}`, { headers: { 'User-Agent': 'ModDownloader/1.0 (browser)' } });
+    }
+
+    async function buildModrinthZip(project, { loader, mc, withDeps, recursive, includeOptional }) {
+      if (!window.JSZip) throw new Error('JSZip не загрузился.');
+      const zip = new JSZip();
+      const mods = zip.folder('mods');
+
+      const picked = []; // {projectId, version, file}
+      const seen = new Set();
+
+      async function addProjectById(pid, reason) {
+        if (seen.has(pid)) return;
+        seen.add(pid);
+
+        const v = await getModrinthBestVersion(pid, { loader, mc });
+        if (!v) {
+          picked.push({ projectId: pid, skipped: true, reason: `Нет подходящей версии (${reason})` });
+          return;
+        }
+        const file = pickModrinthFileFromVersion(v);
+        if (!file?.url) {
+          picked.push({ projectId: pid, skipped: true, reason: `Нет прямой ссылки на файл (${reason})` });
+          return;
+        }
+
+        // Download jar
+        const buf = await fetchArrayBuffer(file.url);
+        mods.file(safeName(file.fileName || `${pid}.jar`), buf);
+        picked.push({ projectId: pid, versionId: v.id, fileName: file.fileName, url: file.url, reason });
+
+        if (!withDeps) return;
+        const deps = Array.isArray(v.dependencies) ? v.dependencies : [];
+
+        for (const d of deps) {
+          const t = String(d.dependency_type || '').toLowerCase();
+          const depPid = d.project_id;
+          if (!depPid) continue;
+          if (t === 'required' || (includeOptional && t === 'optional')) {
+            if (!recursive && reason !== 'root') continue;
+            await addProjectById(depPid, `dependency:${depTypeToHuman(t)}`);
+          }
+        }
+      }
+
+      await addProjectById(project.id, 'root');
+      zip.file('manifest.json', JSON.stringify({
+        generator: 'Mod Downloader (browser)',
+        createdAt: new Date().toISOString(),
+        source: 'Modrinth',
+        project: { id: project.id, title: project.title, slug: project.slug, pageUrl: project.pageUrl },
+        mc, loader,
+        options: { withDeps, recursive, includeOptional },
+        files: picked,
+      }, null, 2));
+
+      return { zip, picked };
+    }
+
     async function searchModrinth(query, { loader, mc, limit }) {
       const facets = [];
       const loaderFacet = guessLoaderFacet(loader);
@@ -293,6 +431,105 @@
     // --- CurseForge API (may be blocked by CORS from browser) ---
     const CF_BASE = 'https://api.curseforge.com';
     // Minecraft categoryId: Mods = 6. We'll use search endpoint.
+    async function getCurseForgeMod(modId, { token, proxyBase }) {
+      const baseUrl = (proxyBase || CF_BASE).replace(/\/$/, '');
+      const url = baseUrl + `/v1/mods/${modId}`;
+      const data = await fetchJson(url, { headers: { 'Accept': 'application/json', 'x-api-key': token } });
+      return data?.data || null;
+    }
+
+    async function getCurseForgeFiles(modId, { token, proxyBase, pageSize = 50 }) {
+      const baseUrl = (proxyBase || CF_BASE).replace(/\/$/, '');
+      const filesUrl = new URL(baseUrl + `/v1/mods/${modId}/files`);
+      filesUrl.searchParams.set('pageSize', String(pageSize));
+      const fdata = await fetchJson(filesUrl.toString(), { headers: { 'Accept': 'application/json', 'x-api-key': token } });
+      return fdata?.data || [];
+    }
+
+    async function getCurseForgeDownloadUrl(modId, fileId, { token, proxyBase }) {
+      const baseUrl = (proxyBase || CF_BASE).replace(/\/$/, '');
+      const durl = baseUrl + `/v1/mods/${modId}/files/${fileId}/download-url`;
+      const dd = await fetchJson(durl, { headers: { 'Accept': 'application/json', 'x-api-key': token } });
+      return dd?.data || null;
+    }
+
+    function pickCurseForgeFile(files, { loader, mc }) {
+      const filtered = (files || [])
+        .filter(f => !mc || (f.gameVersions || []).includes(mc))
+        .filter(f => loader === 'any' || (f.gameVersions || []).some(v => String(v).toLowerCase().includes(loader)))
+        .sort((a,b) => new Date(b.fileDate) - new Date(a.fileDate));
+      return filtered[0] || null;
+    }
+
+    function getCurseForgeDepsFromMod(mod) {
+      // relations.dependencies: [{modId, relationType}]
+      // relationType: 3=requiredDependency, 2=optionalDependency, 5=embeddedLibrary ... (varies)
+      const deps = mod?.relations?.dependencies || [];
+      return deps.map(d => ({ modId: d.modId, relationType: d.relationType }));
+    }
+
+    async function buildCurseForgeZip(modItem, { loader, mc, token, withDeps, recursive, includeOptional, proxyBase }) {
+      if (!window.JSZip) throw new Error('JSZip не загрузился.');
+      const zip = new JSZip();
+      const mods = zip.folder('mods');
+
+      const picked = [];
+      const seen = new Set();
+
+      async function addModById(modId, reason) {
+        if (seen.has(modId)) return;
+        seen.add(modId);
+
+        const mod = await getCurseForgeMod(modId, { token, proxyBase });
+        if (!mod) {
+          picked.push({ modId, skipped: true, reason: `Не удалось получить мод (${reason})` });
+          return;
+        }
+
+        const files = await getCurseForgeFiles(modId, { token, proxyBase, pageSize: 50 });
+        const pick = pickCurseForgeFile(files, { loader, mc });
+        if (!pick) {
+          picked.push({ modId, skipped: true, reason: `Нет подходящего файла (${reason})` });
+          return;
+        }
+
+        let direct = null;
+        try { direct = await getCurseForgeDownloadUrl(modId, pick.id, { token, proxyBase }); } catch {}
+        if (!direct) {
+          picked.push({ modId, skipped: true, reason: `Нет прямой ссылки (CurseForge ограничивает загрузку) (${reason})`, fileName: pick.fileName });
+        } else {
+          const buf = await fetchArrayBuffer(direct);
+          mods.file(safeName(pick.fileName || `${modId}.jar`), buf);
+          picked.push({ modId, fileId: pick.id, fileName: pick.fileName, url: direct, reason });
+        }
+
+        if (!withDeps) return;
+        const deps = getCurseForgeDepsFromMod(mod);
+        for (const d of deps) {
+          const rt = Number(d.relationType);
+          const isRequired = rt === 3;
+          const isOptional = rt === 2;
+          if (!isRequired && !(includeOptional && isOptional)) continue;
+          if (!recursive && reason !== 'root') continue;
+          await addModById(d.modId, `dependency:${isRequired ? 'required' : 'optional'}`);
+        }
+      }
+
+      await addModById(modItem.id, 'root');
+
+      zip.file('manifest.json', JSON.stringify({
+        generator: 'Mod Downloader (browser)',
+        createdAt: new Date().toISOString(),
+        source: 'CurseForge',
+        project: { id: modItem.id, title: modItem.title, slug: modItem.slug, pageUrl: modItem.pageUrl },
+        mc, loader,
+        options: { withDeps, recursive, includeOptional },
+        files: picked,
+      }, null, 2));
+
+      return { zip, picked };
+    }
+
     async function searchCurseForge(query, { loader, mc, limit, token, proxyBase }) {
       const baseUrl = (proxyBase || CF_BASE).replace(/\/$/, '');
       const url = new URL(baseUrl + '/v1/mods/search');
@@ -444,6 +681,7 @@
             <div class="flex gap-2 flex-wrap">
               <a href="${escapeHtml(it.pageUrl)}" target="_blank" rel="noreferrer" class="px-3 py-2 rounded-xl border border-white/10 hover:bg-white/5 text-sm">Открыть страницу</a>
               ${hasDirect ? `<a href="${escapeHtml(file.url)}" target="_blank" rel="noreferrer" class="px-3 py-2 rounded-xl bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-semibold text-sm">Скачать</a>` : `<button data-action="copy" class="px-3 py-2 rounded-xl border border-white/10 hover:bg-white/5 text-sm">Скопировать ссылку</button>`}
+              <button data-action="zip" class="px-3 py-2 rounded-xl bg-cyan-500 hover:bg-cyan-400 text-slate-950 font-semibold text-sm">Скачать ZIP</button>
               <button data-action="details" class="px-3 py-2 rounded-xl border border-white/10 hover:bg-white/5 text-sm">Детали</button>
             </div>
             ${(!hasDirect && file) ? `<div class="text-xs text-amber-200/90 bg-amber-500/10 border border-amber-400/30 rounded-xl px-3 py-2">Прямая ссылка недоступна. Откройте страницу проекта или попробуйте «Скопировать ссылку» (если есть).</div>` : ''}
@@ -463,10 +701,33 @@
                 </div>
                 <button class="px-3 py-1.5 rounded-lg border border-white/10 hover:bg-white/5">Закрыть</button>
               </div>
+
+              <div class="mt-3 grid sm:grid-cols-3 gap-2">
+                <button data-action="zip" class="px-3 py-2 rounded-xl bg-cyan-500 hover:bg-cyan-400 text-slate-950 font-semibold text-sm">Скачать ZIP (с настройками сверху)</button>
+                <a href="${escapeHtml(it.pageUrl)}" target="_blank" rel="noreferrer" class="px-3 py-2 rounded-xl border border-white/10 hover:bg-white/5 text-sm text-center">Открыть страницу</a>
+                <button data-action="copy" class="px-3 py-2 rounded-xl border border-white/10 hover:bg-white/5 text-sm">Скопировать ссылку</button>
+              </div>
+
               <pre class="mt-4 p-3 rounded-xl bg-slate-950/60 border border-white/10 overflow-auto text-xs leading-relaxed mono">${escapeHtml(payload)}</pre>
             </div>
           `;
           dlg.querySelector('button').addEventListener('click', () => dlg.close());
+
+          dlg.querySelector('[data-action="copy"]').addEventListener('click', async () => {
+            const url = it.bestFile?.url || it.pageUrl;
+            try {
+              await navigator.clipboard.writeText(url);
+              showNotice('Ссылка скопирована в буфер обмена.');
+              setTimeout(() => showNotice(''), 2000);
+            } catch {
+              showNotice('Не удалось скопировать автоматически. Откройте страницу проекта и скопируйте вручную.');
+            }
+          });
+
+          dlg.querySelector('[data-action="zip"]').addEventListener('click', async () => {
+            await downloadZipForItem(it);
+          });
+
           document.body.appendChild(dlg);
           dlg.addEventListener('close', () => dlg.remove());
           dlg.showModal();
@@ -486,6 +747,13 @@
           });
         }
 
+        const zipBtn = el.querySelector('[data-action="zip"]');
+        if (zipBtn) {
+          zipBtn.addEventListener('click', async () => {
+            await downloadZipForItem(it);
+          });
+        }
+
         container.appendChild(el);
       }
     }
@@ -495,6 +763,67 @@
       $('btnSearch').disabled = on;
       $('btnSearch').classList.toggle('opacity-60', on);
       $('btnSearch').classList.toggle('cursor-not-allowed', on);
+    }
+
+    function setGlobalBusy(on, text='') {
+      if (on) {
+        $('loading').textContent = text || 'Загрузка…';
+      } else {
+        $('loading').textContent = 'Загрузка…';
+      }
+      $('loading').classList.toggle('hidden', !on);
+    }
+
+    async function downloadZipForItem(it) {
+      const loader = $('loader').value;
+      const mc = $('mc').value.trim();
+      const withDeps = !!$('zipWithDeps')?.checked;
+      const recursive = !!$('zipRecursive')?.checked;
+      const includeOptional = !!$('zipIncludeOptional')?.checked;
+      const token = $('cfToken').value.trim();
+
+      showNotice('');
+      try {
+        setGlobalBusy(true, 'Собираю ZIP…');
+
+        let out;
+        if (it.source === 'Modrinth') {
+          out = await buildModrinthZip(it, { loader, mc, withDeps, recursive, includeOptional });
+        } else {
+          if (!token) throw new Error('Нужен CurseForge API token.');
+          out = await buildCurseForgeZip(it, { loader, mc, token, withDeps, recursive, includeOptional });
+        }
+
+        setGlobalBusy(true, 'Упаковываю ZIP…');
+        const blob = await out.zip.generateAsync({ type: 'blob', compression: 'DEFLATE', compressionOptions: { level: 6 } });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        const base = safeName(it.title || it.slug || String(it.id));
+        const suffix = [mc || 'any', loader || 'any', withDeps ? 'deps' : 'nodeps'].join('-');
+        a.download = `${base}-${suffix}.zip`;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        URL.revokeObjectURL(url);
+
+        const skipped = (out.picked || []).filter(x => x.skipped);
+        if (skipped.length) {
+          showNotice(`ZIP создан, но некоторые зависимости пропущены: ${skipped.length}. Откройте «Детали» для списка (manifest.json внутри ZIP тоже содержит причины).`);
+        } else {
+          showNotice('ZIP создан и скачан.');
+          setTimeout(() => showNotice(''), 2200);
+        }
+      } catch (e) {
+        const msg = String(e?.message || e);
+        if (msg.toLowerCase().includes('failed to fetch') || msg.toLowerCase().includes('cors')) {
+          showNotice('Сборка ZIP: запросы заблокированы (CORS). Для CurseForge обычно нужен прокси/сервер, чтобы получать direct download URL.');
+        } else {
+          showNotice('Сборка ZIP: ' + msg);
+        }
+      } finally {
+        setGlobalBusy(false);
+      }
     }
 
     async function doSearch() {
